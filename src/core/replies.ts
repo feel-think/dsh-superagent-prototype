@@ -78,7 +78,10 @@ export class Replies extends EnginePart {
     if (request.purpose === 'answer' && !trigger?.human) throw new UserError('notQuestion')
     const id = attention ? key('attention-reply', attention.id) : key('reply', trigger?.id ?? ticket?.id ?? '', request.text)
     const existing = this.options.outbox.status(id)
-    const ready = !ticket || !trigger || ticket.answers?.includes(trigger.id)
+    // An answer is the main Session's once no ticket's worker still decides the trigger (see `workerDecides`); while one
+    // does, only its worker's answer, a Report that named the trigger, goes out.
+    const ready = request.purpose !== 'answer' || !trigger
+      || ticket?.answers?.includes(trigger.id) || !this.workerDecides(trigger)
     if (request.purpose === 'answer' && !ready && !existing) throw new UserError('noAnswer')
     const asker = attention?.triggerId ? this.repo.triggers.get(attention.triggerId) : undefined
     const channel = request.purpose === 'answer' ? trigger!.channel : asker?.channel ?? (ticket ? this.sourceChannel(ticket) : undefined)
@@ -89,6 +92,17 @@ export class Replies extends EnginePart {
       this.repo.tickets.save(ticket)
     }
     return { id, status: this.options.outbox.status(id) ?? 'pending', reused: existing !== undefined }
+  }
+  /**
+   * Whether a ticket's worker still decides the Trigger: a Trigger a ticket was accepted from (its origin or batch) stays
+   * that ticket's while it is live, and a follow-up stays with the tickets that still own it (see `followupOwners`). With
+   * none, an answer is the main Session's; while one decides it, only its worker's answer (a Report that named the trigger)
+   * goes out.
+   */
+  private workerDecides(trigger: Trigger): boolean {
+    return this.owners(trigger).length > 0
+      || this.repo.tickets.list().some(ticket => liveTicket(ticket)
+        && (ticket.origin.triggerId === trigger.id || ticket.origin.triggerIds.includes(trigger.id)))
   }
   /** The conversation a ticket started in: its origin Trigger's Channel, else its first Channel. */
   private sourceChannel(ticket: Ticket): ChannelRef | undefined { return this.source(ticket)?.channel ?? ticket.channels[0] }
