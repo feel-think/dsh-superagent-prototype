@@ -1092,6 +1092,17 @@ describe('replies', () => {
     expect(h.engine.handback(second, '3', 'neither ticket')).toBe(true)
     expect(h.engine.reply({ purpose: 'answer', triggerId: '3', text: 'Answer' })).toMatchObject({ status: 'pending' })
   })
+  it('answers the request a ticket that ended no longer decides, even though it was accepted from it', () => {
+    const h = harness()
+    const stopped = accepted(h).ticketId!
+    h.engine.stopTicket(stopped)
+    // The stopped ticket keeps its subscription and its origin, but no worker decides the request any more.
+    expect(h.engine.reply({ purpose: 'answer', triggerId: '1', text: 'Yes' })).toMatchObject({ status: 'pending', reused: false })
+    expect(h.outbox.at(-1)).toMatchObject({ channel: trigger('1').channel, text: 'Yes', kind: 'reply' })
+    const dropped = accepted(h, '2', 't2').ticketId!
+    h.engine.report(dropped, { state: 'dropped', summary: 'not doing it' })
+    expect(h.engine.reply({ purpose: 'answer', triggerId: '2', text: 'Ok' })).toMatchObject({ status: 'pending' })
+  })
   it('answers a question a ticket that ended or a person stopped no longer decides', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!

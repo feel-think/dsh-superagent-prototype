@@ -95,12 +95,14 @@ export class Replies extends EnginePart {
   }
   /**
    * Whether a ticket's worker still decides the Trigger: a Trigger a ticket was accepted from (its origin or batch) stays
-   * that ticket's, and a follow-up stays with the tickets that still own it (see `followupOwners`). With none, an answer is
-   * the main Session's; while one decides it, only its worker's answer (a Report that named the trigger) goes out.
+   * that ticket's while it is live, and a follow-up stays with the tickets that still own it (see `followupOwners`). With
+   * none, an answer is the main Session's; while one decides it, only its worker's answer (a Report that named the trigger)
+   * goes out.
    */
   private workerDecides(trigger: Trigger): boolean {
     return this.owners(trigger).length > 0
-      || this.repo.tickets.list().some(ticket => ticket.origin.triggerId === trigger.id || ticket.origin.triggerIds.includes(trigger.id))
+      || this.repo.tickets.list().some(ticket => liveTicket(ticket)
+        && (ticket.origin.triggerId === trigger.id || ticket.origin.triggerIds.includes(trigger.id)))
   }
   /** The conversation a ticket started in: its origin Trigger's Channel, else its first Channel. */
   private sourceChannel(ticket: Ticket): ChannelRef | undefined { return this.source(ticket)?.channel ?? ticket.channels[0] }
