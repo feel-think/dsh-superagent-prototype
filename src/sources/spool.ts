@@ -68,7 +68,7 @@ export function spoolTrigger(message: SpoolMessage, sender: Pick<SpoolSender, 'k
   const root = message.thread ?? message.id
   const thread = { source: SPOOL, id: `${message.conversation}/${root}` }
   const person = sender.kind === 'person'
-  const business = message.business ?? sender.business
+  const business = message.business || sender.business
   return {
     id: key(SPOOL, message.sender, message.id), source: SPOOL, threads: [thread],
     actor: { source: SPOOL, id: message.sender }, human: person,
@@ -218,8 +218,9 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
       try {
         const round = await readSpool(ctx, config, at)
         failures = 0
-        const unreadable = round.unreadable ? `, ${round.unreadable} unreadable` : ''
-        ctx.report(SPOOL, { state: 'ready', at: at.toISOString(), detail: `${round.received} requests read${unreadable}` })
+        const extra = [round.duplicates ? `${round.duplicates} duplicates` : '', round.unreadable ? `${round.unreadable} unreadable` : '']
+          .filter(Boolean).join(', ')
+        ctx.report(SPOOL, { state: 'ready', at: at.toISOString(), detail: `${round.received} requests read${extra ? `, ${extra}` : ''}` })
       } catch (error) {
         failures += 1
         // One failed read is retried on the next round; three in a row need a person.
@@ -229,9 +230,12 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
     await pause((config?.pollSeconds ?? 5) * 1000, signal)
   }
 }
-/** Hands each request file to the Engine, then moves it into `.done`; a file that is not a request moves into `.bad`. */
-export async function readSpool(ctx: SourceContext, config: SpoolConfig, now: Date): Promise<{ received: number; unreadable: number }> {
-  const round = { received: 0, unreadable: 0 }
+/**
+ * Hands each request file to the Engine, then moves it into `.done`; a file that is not a request moves into `.bad`. A read
+ * error throws and leaves the file in place, so the next round retries it and health shows a failed poll.
+ */
+export async function readSpool(ctx: SourceContext, config: SpoolConfig, now: Date): Promise<{ received: number; duplicates: number; unreadable: number }> {
+  const round = { received: 0, duplicates: 0, unreadable: 0 }
   const names = await readdir(config.inDir).catch((error: unknown) => {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
     throw error
@@ -243,16 +247,22 @@ export async function readSpool(ctx: SourceContext, config: SpoolConfig, now: Da
     const sender = config.senders.find(item => item.id === parsed.data.sender) ?? { kind: 'bot' as const, business: '' }
     const trigger = spoolTrigger(parsed.data, sender, config.outDir, now)
     // An unlisted sender's request is still received, so the panel shows it as filtered with the reason.
-    if (await ctx.receive(trigger) === 'stored') round.received += 1
+    const result = await ctx.receive(trigger)
+    if (result === 'stored') round.received += 1
+    else if (result === 'duplicate') round.duplicates += 1
     await moveInto(file, join(config.inDir, '.done'))
     ctx.threads.describe(threadKey(trigger.threads[0]!), { label: parsed.data.conversation,
       facts: { conversation: { value: parsed.data.conversation }, sender: { value: parsed.data.sender } } })
   }
   return round
 }
-/** The JSON value a file holds, or undefined when it cannot be read or is not JSON, so one bad file never fails a whole round. */
+/**
+ * The JSON value a file holds, or undefined when its text is not JSON. A read error (EACCES, EISDIR, EMFILE, …) throws, so the
+ * round retries instead of moving a request that could not be read into `.bad`.
+ */
 async function readJson(file: string): Promise<unknown> {
-  try { return JSON.parse(await readFile(file, 'utf8')) as unknown } catch { return undefined }
+  const text = await readFile(file, 'utf8')
+  try { return JSON.parse(text) as unknown } catch { return undefined }
 }
 /** Moves `file` into `dir`, created when missing, keeping its name; a name already taken there gets a numeric suffix. */
 async function moveInto(file: string, dir: string): Promise<string> {
