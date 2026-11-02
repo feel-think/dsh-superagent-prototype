@@ -112,8 +112,8 @@ export const spoolKind: SourceKind<SpoolConfig> = {
   schema: SpoolConfigSchema,
   fields: [
     { key: 'inDir', type: 'text', label: { zh: '收取目录', en: 'Incoming folder' },
-      hint: { zh: '绝对路径。读过的文件移进 .done，读不了的移进 .bad。程序应先写临时文件再改名，避免半截 JSON 被读到。',
-        en: 'An absolute path. Read files move into .done, unreadable ones into .bad. A program should write a temporary file and rename it, so half-written JSON is never read.' } },
+      hint: { zh: '绝对路径。读过的文件移进 .done，格式不对的移进 .bad；读不了的留在原地并在 health 里计为 failing。程序应先写临时文件再改名，避免半截 JSON 被读到。',
+        en: 'An absolute path. Read files move into .done, files that are not a valid request into .bad; unreadable ones stay and count as failing. A program should write a temporary file and rename it, so half-written JSON is never read.' } },
     { key: 'outDir', type: 'text', label: { zh: '回复目录', en: 'Reply folder' },
       hint: { zh: '绝对路径。回复写成 <对话>/<消息 id>.json，程序读取后自行删除。',
         en: 'An absolute path. Replies are written as <conversation>/<message id>.json; the program reads and removes them.' } },
@@ -218,8 +218,8 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
       try {
         const round = await readSpool(ctx, config, at)
         failures = 0
-        const extra = [round.duplicates ? `${round.duplicates} duplicates` : '', round.unreadable ? `${round.unreadable} unreadable` : '']
-          .filter(Boolean).join(', ')
+        const extra = [round.duplicates ? `${round.duplicates} duplicates` : '', round.unreadable ? `${round.unreadable} unreadable` : '',
+          round.failed ? `${round.failed} failing` : ''].filter(Boolean).join(', ')
         ctx.report(SPOOL, { state: 'ready', at: at.toISOString(), detail: `${round.received} requests read${extra ? `, ${extra}` : ''}` })
       } catch (error) {
         failures += 1
@@ -231,18 +231,27 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
   }
 }
 /**
- * Hands each request file to the Engine, then moves it into `.done`; a file that is not a request moves into `.bad`. A read
- * error throws and leaves the file in place, so the next round retries it and health shows a failed poll.
+ * Hands each request file to the Engine, then moves it into `.done`; a file that is not a request moves into `.bad`. A file
+ * that cannot be read is left in place and counted as failing; the other files are still read, so one bad file never blocks
+ * the folder. Only a `readdir` failure throws the round.
  */
-export async function readSpool(ctx: SourceContext, config: SpoolConfig, now: Date): Promise<{ received: number; duplicates: number; unreadable: number }> {
-  const round = { received: 0, duplicates: 0, unreadable: 0 }
+export async function readSpool(ctx: SourceContext, config: SpoolConfig, now: Date): Promise<{ received: number; duplicates: number; unreadable: number; failed: number }> {
+  const round = { received: 0, duplicates: 0, unreadable: 0, failed: 0 }
   const names = await readdir(config.inDir).catch((error: unknown) => {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
     throw error
   })
   for (const name of names.filter(item => item.endsWith('.json') && !item.startsWith('.')).sort()) {
     const file = join(config.inDir, name)
-    const parsed = SpoolMessageSchema.safeParse(await readJson(file))
+    let value: unknown
+    try {
+      value = await readJson(file)
+    } catch {
+      // Permission, I/O or a directory named like a request: leave it and try again next round.
+      round.failed += 1
+      continue
+    }
+    const parsed = SpoolMessageSchema.safeParse(value)
     if (!parsed.success) { round.unreadable += 1; await moveInto(file, join(config.inDir, '.bad')); continue }
     const sender = config.senders.find(item => item.id === parsed.data.sender) ?? { kind: 'bot' as const, business: '' }
     const trigger = spoolTrigger(parsed.data, sender, config.outDir, now)
@@ -257,8 +266,8 @@ export async function readSpool(ctx: SourceContext, config: SpoolConfig, now: Da
   return round
 }
 /**
- * The JSON value a file holds, or undefined when its text is not JSON. A read error (EACCES, EISDIR, EMFILE, …) throws, so the
- * round retries instead of moving a request that could not be read into `.bad`.
+ * The JSON value a file holds, or undefined when its text is not JSON. A read error (EACCES, EISDIR, EMFILE, …) throws, so
+ * `readSpool` counts that file as failing and leaves it for the next round.
  */
 async function readJson(file: string): Promise<unknown> {
   const text = await readFile(file, 'utf8')

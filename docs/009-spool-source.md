@@ -10,7 +10,7 @@ The kind is `spool`. It ships as the `dsh-superagent/spool-watch` plugin, insert
 
 | Field | Meaning |
 | --- | --- |
-| Incoming folder | An absolute path. The Source polls `*.json` files here. Read files move into `.done`; files that are not a valid request move into `.bad`. |
+| Incoming folder | An absolute path. The Source polls `*.json` files here. Read files move into `.done`; files that are not a valid request move into `.bad`; unreadable files stay and count as failing. |
 | Reply folder | An absolute path. A reply is written as `<reply folder>/<conversation>/<message id>.json`. Leave it empty while requests need no answers. |
 | Senders | The identities a program may use. Each has an `id`, an **Acts for** value (`Relays a person` or `Itself`) and an optional default business. The identity is fixed here: a program cannot choose to be a person by writing a field. |
 | Polling interval | Seconds between reads; 2–600, default 5. |
@@ -113,9 +113,9 @@ Each is empty for a Ticket that did not start in the Spool.
 
 ## Operations
 
-- **Read files.** After a request is received, the file moves into `.done`; a duplicate is moved too, without a second Trigger, and the health detail counts it. Text that is not a valid request moves into `.bad`. An unreadable file (permission, I/O, a directory named like a request) stays in place and fails the round, so the Source retries it and reports the failure instead of silently dropping the request. `.bad` is not pruned yet.
+- **Read files.** After a request is received, the file moves into `.done`; a duplicate is moved too, without a second Trigger, and the health detail counts it. Text that is not a valid request moves into `.bad`. A file that cannot be read (permission, I/O, a directory named like a request) stays in place and is counted as `failing` in the health detail; the other files in the folder are still read, and the unreadable one is retried every round. Fix or remove it by hand; `.bad` is not pruned yet.
 - **One poller per folder.** A receiving folder belongs to one dsh-superagent instance; two pollers would race on `.done` and `.bad`.
-- **Health.** The Source reports `spool` health: waiting for setup, off, no incoming folder, the last round's counts, or three consecutive polling failures.
+- **Health.** The Source reports `spool` health: waiting for setup, off, no incoming folder, the last round's counts (read, duplicates, unreadable, failing), or three consecutive polling failures.
 - **Threads.** A Thread key is `spool:<conversation>/<root>`. The panel labels the Thread with its conversation and records the sender and conversation as facts. `orchestrator_read thread/spool:<conversation>/<root>` and a search for that key work without extra code.
 - **No Thread context.** Requests are single files, so assessments read the Trigger's own text; there is no conversation to page through. Put what an assessment needs into `text` (or an attachment path the worker can read).
 - **Access.** Anyone who can write to the incoming folder can submit a request, and the file's `sender` selects one of the configured identities. The identity's person or program nature still comes from the configuration, but protect the folder: a writer can speak as any configured sender.

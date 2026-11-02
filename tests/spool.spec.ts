@@ -89,7 +89,7 @@ describe('the spool Source', () => {
     drop(h.config.inDir, 'c.json', '{not json')
     drop(h.config.inDir, 'ignored.txt', 'not a request')
     drop(h.config.inDir, '.hidden.json', request({ id: 'm3' }))
-    expect(await readSpool(h.ctx, h.config, new Date('2026-11-02T00:00:00.000Z'))).toEqual({ received: 1, duplicates: 0, unreadable: 1 })
+    expect(await readSpool(h.ctx, h.config, new Date('2026-11-02T00:00:00.000Z'))).toEqual({ received: 1, duplicates: 0, unreadable: 1, failed: 0 })
     expect(h.engine.candidate(key('spool', 'relay', 'm1'))?.strength).toBe('explicit')
     expect(h.store.triggers.disposition(key('spool', 'stranger', 'm2'))?.filtered).toEqual({ code: 'sender_not_listed' })
     expect(readdirSync(join(h.config.inDir, '.done')).sort()).toEqual(['a.json', 'b.json'])
@@ -98,23 +98,26 @@ describe('the spool Source', () => {
       facts: { conversation: { value: 'chief' }, sender: { value: 'relay' } } })
     // Reusing a request id is a duplicate, and the file is still moved without replacing the first `.done` file.
     drop(h.config.inDir, 'a.json', request({ business: 'content' }))
-    expect(await readSpool(h.ctx, h.config, new Date())).toEqual({ received: 0, duplicates: 1, unreadable: 0 })
+    expect(await readSpool(h.ctx, h.config, new Date())).toEqual({ received: 0, duplicates: 1, unreadable: 0, failed: 0 })
     expect(readdirSync(join(h.config.inDir, '.done')).sort()).toEqual(['a.1.json', 'a.json', 'b.json'])
     h.store.close()
   })
-  it('leaves a request it cannot read in place, so the round fails and retries instead of setting it aside', async () => {
+  it('isolates a file it cannot read, so the other requests are still read', async () => {
     const h = host()
     // A directory named like a request is an IO error on every platform, like an unreadable file.
-    mkdirSync(join(h.config.inDir, 'locked.json'))
-    await expect(readSpool(h.ctx, h.config, new Date())).rejects.toThrow()
-    expect(readdirSync(h.config.inDir)).toEqual(['locked.json'])
+    mkdirSync(join(h.config.inDir, 'a-stuck.json'))
+    drop(h.config.inDir, 'b.json', request({ id: 'm5' }))
+    expect(await readSpool(h.ctx, h.config, new Date('2026-11-02T00:00:00.000Z')))
+      .toEqual({ received: 1, duplicates: 0, unreadable: 0, failed: 1 })
+    expect(readdirSync(h.config.inDir).sort()).toEqual(['.done', 'a-stuck.json'])
+    expect(readdirSync(join(h.config.inDir, '.done'))).toEqual(['b.json'])
     expect(existsSync(join(h.config.inDir, '.bad'))).toBe(false)
     h.store.close()
   })
   it('admits a program acting for itself only as an inferred candidate of a listed bot', async () => {
     const h = host()
     drop(h.config.inDir, 'alert.json', { id: 'x1', sender: 'monitor', conversation: 'alerts', text: 'site down' })
-    expect(await readSpool(h.ctx, h.config, new Date('2026-11-02T00:00:00.000Z'))).toEqual({ received: 1, duplicates: 0, unreadable: 0 })
+    expect(await readSpool(h.ctx, h.config, new Date('2026-11-02T00:00:00.000Z'))).toEqual({ received: 1, duplicates: 0, unreadable: 0, failed: 0 })
     const trigger = spoolTrigger(SpoolMessageSchema.parse({ id: 'x1', sender: 'monitor', conversation: 'alerts', text: 'site down' }),
       { kind: 'bot', business: 'ops' }, h.config.outDir, new Date())
     expect(trigger).toMatchObject({ human: false, addressed: 'direct' })
