@@ -48,12 +48,12 @@ Then set the folders and senders in the panel and save the Source. Saving the So
 | `id` | yes | A request id, unique for its sender. It is part of the Trigger id, so reusing it is a duplicate, not a second request. |
 | `sender` | yes | A sender id from the Source configuration. An id not on that list is received but filtered with the reason `sender_not_listed`. |
 | `conversation` | no | A folder name under the reply folder; `default` when omitted. |
-| `thread` | no | The request that began this exchange. A later request naming it joins its Thread and follows up on its Ticket; omitted means this request starts a Thread. |
+| `thread` | no | The request that began this exchange. A relaying person's later request naming it follows up on its Ticket; a program's also reaches Eval, because non-human Triggers are always assessed. Omitted means this request starts a Thread. |
 | `text` | yes | What the agent should do, up to 20,000 characters. It is untrusted data, not authorization. |
 | `business` | no | A business id; the sender's default business applies when omitted. |
 | `type` | no | A work type, such as `research` or `review`, for the Executor. |
-| `repo` | no | An absolute path of a local repository the request concerns. |
-| `at` | no | An ISO 8601 time with an offset; now when omitted. |
+| `repo` | no | An absolute path of a local repository the request concerns. It is passed through to the worker environment; the Source does not check that it exists. |
+| `at` | no | An ISO 8601 time with an offset; now when omitted. It is normalized, not range-checked. |
 | `addressed` | no | `true` by default. `false` makes a relaying person's message an unaddressed admission case. |
 | `url` | no | A page people can open for the original signal. |
 
@@ -75,6 +75,18 @@ The agent answers where the Trigger's Channel points: a file named after the out
 ```
 
 `kind` is `acknowledgement`, `reply` or `notice`. The file is written once and never replaced, so a retried send stays idempotent; the program reads the file and removes it. A request received while the reply folder was empty has no destination, so its messages are dropped as `gone` and the Source shows them in the panel.
+
+Changing the reply folder after a request has been received drops that Ticket's later replies: the saved Channel address is checked against the current folder. Finish open Tickets first, or keep the old folder configured.
+
+## Notifying a person in Feishu
+
+A Spool-triggered Ticket has no Feishu Channel: its replies go to the reply folder. To notify a person in Feishu, put the destination chat in the request — for example a line `notify: feishu chat oc_…` — and have the worker send it with the bot's CLI after the work:
+
+```sh
+lark-cli im +messages-send --chat-id oc_… --text "…"
+```
+
+This works without a code change when the deployment has a Feishu bot, because workers get a bot-only `lark-cli`. It is not the Outbox: the send has no idempotency key, retry or audit, so keep the message short and repeatable. For a built-in path, the Source would need a notification target of its own.
 
 ## Who may originate work
 
@@ -101,7 +113,8 @@ Each is empty for a Ticket that did not start in the Spool.
 
 ## Operations
 
-- **Read files.** After a request is received, the file moves into `.done`; a duplicate is moved too, without a second Trigger. A file that fails to parse as a request moves into `.bad`. Both folders are created on demand.
+- **Read files.** After a request is received, the file moves into `.done`; a duplicate is moved too, without a second Trigger, and the health detail counts it. Text that is not a valid request moves into `.bad`. An unreadable file (permission, I/O, a directory named like a request) stays in place and fails the round, so the Source retries it and reports the failure instead of silently dropping the request. `.bad` is not pruned yet.
+- **One poller per folder.** A receiving folder belongs to one dsh-superagent instance; two pollers would race on `.done` and `.bad`.
 - **Health.** The Source reports `spool` health: waiting for setup, off, no incoming folder, the last round's counts, or three consecutive polling failures.
 - **Threads.** A Thread key is `spool:<conversation>/<root>`. The panel labels the Thread with its conversation and records the sender and conversation as facts. `orchestrator_read thread/spool:<conversation>/<root>` and a search for that key work without extra code.
 - **No Thread context.** Requests are single files, so assessments read the Trigger's own text; there is no conversation to page through. Put what an assessment needs into `text` (or an attachment path the worker can read).
