@@ -90,6 +90,12 @@ An acknowledgement is the program's bookkeeping, so it always goes to the reply 
 
 A Feishu reply needs the deployment's Feishu bot and the bot must be in the chat; a failed send is retried and shows under the **Messages to Channels** health. A person's answer in that message's thread reaches the Ticket as context, not as a new request: it answers the question the Ticket asked without widening the Ticket's scope. A new message outside the thread is a separate conversation and does not reach the Ticket.
 
+For that answer to come back, the **Feishu Source** must also be on and listening to the chat: the chat is in its **Chats**, or matched by **Other chats** (with `mentions`, the person must @ the bot), and a direct message needs **Direct messages** on. An off Source drops the answer as `source_disabled` and the Ticket waits with no input; an uninstalled Source cannot read the thread, its images or send the Ticket's later replies. The bot can still post while the Source is off, so set the Source up before choosing a Feishu Reply to.
+
+The Ticket subscribes to the thread through the running app's `engine.followForContext`, read from the `orchestrator` service. A runtime that does not expose `engine` still posts replies but cannot subscribe the thread, so the answer does not return; this is the only part of the loop that depends on that runtime field.
+
+The 100-word limit applies to the Feishu message (the Spool channel is not the Feishu one, so the Outbox does not check it). With **Both**, a too-long reply fails before the file is written; keep machine results short, or use the JSON folder alone for long ones.
+
 A worker that needs to send an extra message can still use the bot-only `lark-cli` it receives:
 
 ```sh
