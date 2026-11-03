@@ -26,7 +26,7 @@ function host(overrides: Partial<SourceContextDeps> = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'spool-'))
   dirs.push(dir)
   const config: SpoolConfig = { inDir: join(dir, 'in'), outDir: join(dir, 'out'), pollSeconds: 5,
-    senders: [{ id: 'relay', kind: 'person', business: 'general' }, { id: 'monitor', kind: 'bot', business: 'ops' }] }
+    senders: [{ id: 'relay', kind: 'person', business: 'general', reply: 'json', notifyChat: '' }, { id: 'monitor', kind: 'bot', business: 'ops', reply: 'json', notifyChat: '' }] }
   const store = new Store(join(dir, 'db.sqlite'))
   store.saveSettings(SettingsSchema.parse({ eval: { mode: 'auto' }, sources: { spool: { enabled: true, config } },
     policy: { sources: { spool: { allowed: [{ id: 'relay' }], bots: [{ id: 'monitor' }] } } } }))
@@ -55,28 +55,33 @@ const request = (fields: Record<string, unknown> = {}) => ({ id: 'm1', sender: '
 describe('the spool Source', () => {
   it('maps a request to a stable Trigger on its conversation and root, with the sender fixed by configuration', () => {
     const now = new Date('2026-11-02T00:00:00.000Z')
-    const trigger = spoolTrigger(SpoolMessageSchema.parse(request({ business: 'content' })), { kind: 'person', business: 'general' },
+    const trigger = spoolTrigger(SpoolMessageSchema.parse(request({ business: 'content' })), { kind: 'person', business: 'general', reply: 'json', notifyChat: '' },
       '/srv/spool/out', now)
     expect(trigger).toMatchObject({ id: key('spool', 'relay', 'm1'), source: 'spool', threads: [{ source: 'spool', id: 'chief/m1' }],
       actor: { source: 'spool', id: 'relay' }, human: true, addressed: 'direct', at: now.toISOString(), text: '整理本周的周报',
       channel: { source: 'spool', thread: 'spool:chief/m1', address: { conversation: 'chief', root: 'm1', message: 'm1', sender: 'relay',
         dir: '/srv/spool/out/chief' } },
       meta: { conversation: 'chief', sender: 'relay', root: 'm1', messageId: 'm1', business: 'content' } })
+    // A Feishu reply destination travels on the request's Channel; the default stays in the folder.
+    expect(trigger.channel!.address.reply).toBeUndefined()
+    const chatted = spoolTrigger(SpoolMessageSchema.parse(request({ id: 'm5' })),
+      { kind: 'person', business: '', reply: 'feishu', notifyChat: 'oc_team' }, '', now)
+    expect(chatted.channel!.address).toMatchObject({ reply: 'feishu', notifyChat: 'oc_team' })
     // A follow-up names the root; the sender's default business applies when the request names none, and a program is not a person.
     const followup = spoolTrigger(SpoolMessageSchema.parse(request({ id: 'm2', sender: 'monitor', thread: 'm1', addressed: false })),
-      { kind: 'bot', business: 'ops' }, '', now)
+      { kind: 'bot', business: 'ops', reply: 'json', notifyChat: '' }, '', now)
     expect(followup).toMatchObject({ id: key('spool', 'monitor', 'm2'), threads: [{ source: 'spool', id: 'chief/m1' }], human: false,
       meta: { root: 'm1', messageId: 'm2', business: 'ops' }, channel: { address: { root: 'm1', message: 'm2' } } })
     expect(followup.addressed).toBeUndefined()
     expect(followup.channel!.address.dir).toBeUndefined()
     // The default conversation is `default`, and a request may carry its own time and URL.
     const plain = spoolTrigger(SpoolMessageSchema.parse({ id: 'm3', sender: 'relay', text: 'hi', at: '2026-11-01T08:00:00+08:00',
-      url: 'https://example.com/x', repo: '/srv/code' }), { kind: 'person', business: '' }, '/out', now)
+      url: 'https://example.com/x', repo: '/srv/code' }), { kind: 'person', business: '', reply: 'json', notifyChat: '' }, '/out', now)
     expect(plain).toMatchObject({ at: '2026-11-01T00:00:00.000Z', url: 'https://example.com/x', threads: [{ id: 'default/m3' }],
       meta: { conversation: 'default', repo: '/srv/code' } })
     expect(plain.meta.business).toBeUndefined()
     // A program that sends an empty business still falls back to the sender's default.
-    const empty = spoolTrigger(SpoolMessageSchema.parse(request({ id: 'm4', business: '' })), { kind: 'person', business: 'general' }, '', now)
+    const empty = spoolTrigger(SpoolMessageSchema.parse(request({ id: 'm4', business: '' })), { kind: 'person', business: 'general', reply: 'json', notifyChat: '' }, '', now)
     expect(empty.meta.business).toBe('general')
     // A conversation names one folder, and a link opens a web page, not a `javascript:` or `file:` scheme.
     expect(() => SpoolMessageSchema.parse(request({ conversation: '..' }))).toThrow()
@@ -119,7 +124,7 @@ describe('the spool Source', () => {
     drop(h.config.inDir, 'alert.json', { id: 'x1', sender: 'monitor', conversation: 'alerts', text: 'site down' })
     expect(await readSpool(h.ctx, h.config, new Date('2026-11-02T00:00:00.000Z'))).toEqual({ received: 1, duplicates: 0, unreadable: 0, failed: 0 })
     const trigger = spoolTrigger(SpoolMessageSchema.parse({ id: 'x1', sender: 'monitor', conversation: 'alerts', text: 'site down' }),
-      { kind: 'bot', business: 'ops' }, h.config.outDir, new Date())
+      { kind: 'bot', business: 'ops', reply: 'json', notifyChat: '' }, h.config.outDir, new Date())
     expect(trigger).toMatchObject({ human: false, addressed: 'direct' })
     expect(h.engine.candidate(trigger.id)?.strength).toBe('inferred')
     expect(h.assessor.request).toHaveBeenCalledTimes(1)
@@ -143,6 +148,50 @@ describe('the spool Source', () => {
     expect(spoolKind.channel!.allowed!({ ...address, sender: 'stranger' }, h.config)).toBe(false)
     h.store.close()
   })
+  it('routes a sender\'s replies to the folder, a Feishu chat, or both, while acknowledgements stay in the folder', async () => {
+    const h = host()
+    const lark = vi.spyOn(h.commands, 'lark').mockResolvedValue({} as never)
+    const dir = join(h.config.outDir, 'chief')
+    const message = (kind: OutboundMessage['kind'], id: string, extra: Record<string, string> = {}): OutboundMessage => ({ id, kind,
+      text: '用哪个颜色？', ticketId: 't1', channel: { source: 'spool', thread: 'spool:chief/m1',
+        address: { conversation: 'chief', root: 'm1', message: 'm1', sender: 'relay', dir, ...extra } } })
+    // The default goes to the reply folder alone.
+    await spoolKind.channel!.send({ commands: h.commands }, message('reply', 'r1'))
+    expect(lark).not.toHaveBeenCalled()
+    expect(existsSync(join(dir, 'r1.json'))).toBe(true)
+    // A Feishu sender writes no file and posts a new bot message keyed by the message id.
+    await spoolKind.channel!.send({ commands: h.commands }, message('reply', 'r2', { reply: 'feishu', notifyChat: 'oc_team' }))
+    expect(lark).toHaveBeenCalledExactlyOnceWith(['im', '+messages-send', '--chat-id', 'oc_team', '--markdown', '用哪个颜色？',
+      '--idempotency-key', 'r2'])
+    expect(existsSync(join(dir, 'r2.json'))).toBe(false)
+    // Both writes the file and posts.
+    lark.mockClear()
+    await spoolKind.channel!.send({ commands: h.commands }, message('reply', 'r3', { reply: 'both', notifyChat: 'oc_team' }))
+    expect(lark).toHaveBeenCalledOnce()
+    expect(existsSync(join(dir, 'r3.json'))).toBe(true)
+    // An acknowledgement is the program's bookkeeping: it stays in the folder even for a Feishu sender.
+    lark.mockClear()
+    await spoolKind.channel!.send({ commands: h.commands }, message('acknowledgement', 'r4', { reply: 'feishu', notifyChat: 'oc_team' }))
+    expect(lark).not.toHaveBeenCalled()
+    expect(existsSync(join(dir, 'r4.json'))).toBe(true)
+    // A Feishu reply still reaches the person when the reply folder is absent.
+    const nowhere: OutboundMessage = { id: 'r5', kind: 'reply', text: '用哪个颜色？', channel: { source: 'spool', thread: 'spool:chief/m1',
+      address: { conversation: 'chief', sender: 'relay', reply: 'feishu', notifyChat: 'oc_team' } } }
+    lark.mockClear()
+    expect(await spoolKind.channel!.send({ commands: h.commands }, nowhere)).toBe('sent')
+    expect(lark).toHaveBeenCalledExactlyOnceWith(['im', '+messages-send', '--chat-id', 'oc_team', '--markdown', '用哪个颜色？',
+      '--idempotency-key', 'r5'])
+    // With neither destination a reply is gone.
+    const lost: OutboundMessage = { id: 'r6', kind: 'reply', text: 'x', channel: { source: 'spool', thread: 'spool:chief/m1',
+      address: { conversation: 'chief', sender: 'relay' } } }
+    expect(await spoolKind.channel!.send({ commands: h.commands }, lost)).toBe('gone')
+    // The route defaults to the folder, and Feishu replies need a chat id.
+    expect(spoolKind.schema.parse({ senders: [{ id: 'relay' }] }))
+      .toMatchObject({ senders: [{ id: 'relay', reply: 'json', notifyChat: '' }] })
+    expect(() => spoolKind.schema.parse({ senders: [{ id: 'relay', reply: 'feishu' }] })).toThrow('A Feishu chat id is required')
+    expect(() => spoolKind.schema.parse({ senders: [{ id: 'relay', reply: 'both', notifyChat: 'team' }] })).toThrow()
+    h.store.close()
+  })
   it('explains filtering, policy rows and the variables a Ticket receives', () => {
     const h = host()
     expect(spoolKind.scope!({ meta: { sender: 'stranger' } }, h.config)).toEqual({ listened: false, reason: 'sender_not_listed' })
@@ -156,7 +205,7 @@ describe('the spool Source', () => {
     ])
     expect(spoolKind.find!('spool:chief/m1')).toEqual({ threads: ['spool:chief/m1'], terms: [] })
     const trigger = spoolTrigger(SpoolMessageSchema.parse(request({ business: 'content', type: 'research', repo: '/srv/code' })),
-      { kind: 'person', business: 'general' }, '/out', new Date('2026-11-02T00:00:00.000Z'))
+      { kind: 'person', business: 'general', reply: 'json', notifyChat: '' }, '/out', new Date('2026-11-02T00:00:00.000Z'))
     expect(spoolKind.environment!.values({ deployment: testDeployment(), config: h.config, trigger })).toEqual({
       DSH_SUPERAGENT_SPOOL_SENDER: 'relay', DSH_SUPERAGENT_SPOOL_CONVERSATION: 'chief', DSH_SUPERAGENT_SPOOL_BUSINESS: 'content',
       DSH_SUPERAGENT_SPOOL_TYPE: 'research', DSH_SUPERAGENT_SPOOL_REPO: '/srv/code' })
