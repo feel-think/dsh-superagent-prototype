@@ -83,12 +83,12 @@ Changing the reply folder after a request has been received drops that Ticket's 
 A Spool Channel reaches a program, not the person behind it. A sender chooses where its replies go:
 
 - **JSON folder** (the default): replies are written to the reply folder, as above.
-- **Feishu chat**: replies are posted to a chat by the deployment's Feishu bot. A request has no Feishu message to answer in a thread, so each reply is a new message in the chat; the message id is its idempotency key, so a retried delivery posts once.
+- **Feishu chat**: replies are posted to a chat by the deployment's Feishu bot. A request has no Feishu message to answer in a thread, so each reply is a new message in the chat; the message id is its idempotency key, so a retried delivery posts once. After posting, the Source subscribes the Ticket to the thread that message started, so a person's answer posted in that thread reaches the Ticket's Executor; no one has to forward or re-send it.
 - **Both**: the reply file and the Feishu message.
 
 An acknowledgement is the program's bookkeeping, so it always goes to the reply folder, even for a Feishu sender. The choice is recorded on the request when it arrives; changing a sender's setting affects later requests, so finish open Tickets first or keep the old setting.
 
-A Feishu reply needs the deployment's Feishu bot and the bot must be in the chat; a failed send is retried and shows under the **Messages to Channels** health. A person's answer in Feishu arrives as a new Feishu message, not on the Spool Thread: the main Session decides whether to route it to the Ticket.
+A Feishu reply needs the deployment's Feishu bot and the bot must be in the chat; a failed send is retried and shows under the **Messages to Channels** health. A person's answer in that message's thread reaches the Ticket as context, not as a new request: it answers the question the Ticket asked without widening the Ticket's scope. A new message outside the thread is a separate conversation and does not reach the Ticket.
 
 A worker that needs to send an extra message can still use the bot-only `lark-cli` it receives:
 
