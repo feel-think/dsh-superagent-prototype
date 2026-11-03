@@ -10,7 +10,7 @@ import { HealthBoard } from '../src/infra/health.ts'
 import { SettingsSchema, settingsPolicy } from '../src/policy.ts'
 import { sourceContextOf, type SourceContextDeps } from '../src/app/source-context.ts'
 import { testDeployment } from './fixtures/deployment.ts'
-import { apply as applySpool, readSpool, sendSpool, spoolKind, spoolTrigger, SpoolMessageSchema, type SpoolConfig }
+import { apply as applySpool, readSpool, sendSpool, spoolKind, spoolKindWith, spoolTrigger, SpoolMessageSchema, type SpoolConfig }
   from '../src/sources/spool.ts'
 
 const dirs: string[] = []
@@ -148,48 +148,97 @@ describe('the spool Source', () => {
     expect(spoolKind.channel!.allowed!({ ...address, sender: 'stranger' }, h.config)).toBe(false)
     h.store.close()
   })
-  it('routes a sender\'s replies to the folder, a Feishu chat, or both, while acknowledgements stay in the folder', async () => {
+  it('routes a sender\'s replies to the folder, a Feishu chat, or both, and follows the thread a Feishu reply starts', async () => {
     const h = host()
-    const lark = vi.spyOn(h.commands, 'lark').mockResolvedValue({} as never)
+    const followed: { ticket: string; thread: unknown }[] = []
+    const kind = spoolKindWith((ticket, thread) => { followed.push({ ticket, thread }); return true })
+    const lark = vi.spyOn(h.commands, 'lark').mockImplementation(async (args: string[]) => {
+      const idempotency = args[args.indexOf('--idempotency-key') + 1]
+      return { message_id: `om_${idempotency}`, chat_id: 'oc_team' } as never
+    })
     const dir = join(h.config.outDir, 'chief')
     const message = (kind: OutboundMessage['kind'], id: string, extra: Record<string, string> = {}): OutboundMessage => ({ id, kind,
       text: '用哪个颜色？', ticketId: 't1', channel: { source: 'spool', thread: 'spool:chief/m1',
         address: { conversation: 'chief', root: 'm1', message: 'm1', sender: 'relay', dir, ...extra } } })
     // The default goes to the reply folder alone.
-    await spoolKind.channel!.send({ commands: h.commands }, message('reply', 'r1'))
+    await kind.channel!.send({ commands: h.commands }, message('reply', 'r1'))
     expect(lark).not.toHaveBeenCalled()
+    expect(followed).toEqual([])
     expect(existsSync(join(dir, 'r1.json'))).toBe(true)
-    // A Feishu sender writes no file and posts a new bot message keyed by the message id.
-    await spoolKind.channel!.send({ commands: h.commands }, message('reply', 'r2', { reply: 'feishu', notifyChat: 'oc_team' }))
+    // A Feishu sender writes no file, posts a new bot message keyed by the message id, and follows the thread it started.
+    await kind.channel!.send({ commands: h.commands }, message('reply', 'r2', { reply: 'feishu', notifyChat: 'oc_team' }))
     expect(lark).toHaveBeenCalledExactlyOnceWith(['im', '+messages-send', '--chat-id', 'oc_team', '--markdown', '用哪个颜色？',
       '--idempotency-key', 'r2'])
+    expect(followed).toEqual([{ ticket: 't1', thread: { source: 'feishu', id: 'oc_team:om_r2' } }])
     expect(existsSync(join(dir, 'r2.json'))).toBe(false)
     // Both writes the file and posts.
     lark.mockClear()
-    await spoolKind.channel!.send({ commands: h.commands }, message('reply', 'r3', { reply: 'both', notifyChat: 'oc_team' }))
+    await kind.channel!.send({ commands: h.commands }, message('reply', 'r3', { reply: 'both', notifyChat: 'oc_team' }))
     expect(lark).toHaveBeenCalledOnce()
+    expect(followed.at(-1)).toEqual({ ticket: 't1', thread: { source: 'feishu', id: 'oc_team:om_r3' } })
     expect(existsSync(join(dir, 'r3.json'))).toBe(true)
     // An acknowledgement is the program's bookkeeping: it stays in the folder even for a Feishu sender.
     lark.mockClear()
-    await spoolKind.channel!.send({ commands: h.commands }, message('acknowledgement', 'r4', { reply: 'feishu', notifyChat: 'oc_team' }))
+    const before = followed.length
+    await kind.channel!.send({ commands: h.commands }, message('acknowledgement', 'r4', { reply: 'feishu', notifyChat: 'oc_team' }))
     expect(lark).not.toHaveBeenCalled()
+    expect(followed).toHaveLength(before)
     expect(existsSync(join(dir, 'r4.json'))).toBe(true)
     // A Feishu reply still reaches the person when the reply folder is absent.
     const nowhere: OutboundMessage = { id: 'r5', kind: 'reply', text: '用哪个颜色？', channel: { source: 'spool', thread: 'spool:chief/m1',
       address: { conversation: 'chief', sender: 'relay', reply: 'feishu', notifyChat: 'oc_team' } } }
     lark.mockClear()
-    expect(await spoolKind.channel!.send({ commands: h.commands }, nowhere)).toBe('sent')
+    expect(await kind.channel!.send({ commands: h.commands }, nowhere)).toBe('sent')
     expect(lark).toHaveBeenCalledExactlyOnceWith(['im', '+messages-send', '--chat-id', 'oc_team', '--markdown', '用哪个颜色？',
       '--idempotency-key', 'r5'])
+    // A reply with no Ticket (a program's own message) has nothing to follow.
+    expect(followed).toHaveLength(2)
     // With neither destination a reply is gone.
     const lost: OutboundMessage = { id: 'r6', kind: 'reply', text: 'x', channel: { source: 'spool', thread: 'spool:chief/m1',
       address: { conversation: 'chief', sender: 'relay' } } }
-    expect(await spoolKind.channel!.send({ commands: h.commands }, lost)).toBe('gone')
+    expect(await kind.channel!.send({ commands: h.commands }, lost)).toBe('gone')
+    // A result often goes out after its Ticket ended: the message is still sent and the missing Ticket is not an error.
+    const ended = spoolKindWith(() => { throw Object.assign(new Error('ticket ended'), { code: 'ticketEnded' }) })
+    lark.mockClear()
+    expect(await ended.channel!.send({ commands: h.commands }, message('reply', 'r7', { reply: 'feishu', notifyChat: 'oc_team' }))).toBe('sent')
+    expect(lark).toHaveBeenCalledOnce()
+    // Any other follow failure keeps the receipt pending, so the idempotent send retries.
+    const failing = spoolKindWith(() => { throw new Error('database unavailable') })
+    await expect(failing.channel!.send({ commands: h.commands }, message('reply', 'r8', { reply: 'feishu', notifyChat: 'oc_team' })))
+      .rejects.toThrow('database unavailable')
     // The route defaults to the folder, and Feishu replies need a chat id.
     expect(spoolKind.schema.parse({ senders: [{ id: 'relay' }] }))
       .toMatchObject({ senders: [{ id: 'relay', reply: 'json', notifyChat: '' }] })
     expect(() => spoolKind.schema.parse({ senders: [{ id: 'relay', reply: 'feishu' }] })).toThrow('A Feishu chat id is required')
     expect(() => spoolKind.schema.parse({ senders: [{ id: 'relay', reply: 'both', notifyChat: 'team' }] })).toThrow()
+    h.store.close()
+  })
+  it('follows the thread a Feishu notification starts, so a person\'s answer there reaches the Ticket', async () => {
+    const h = host()
+    // A spool request starts a Ticket; its worker asks a question, which the outbox would send through the spool channel.
+    const origin = spoolTrigger(SpoolMessageSchema.parse(request({ id: 'm1' })), { kind: 'person', business: 'general', reply: 'json', notifyChat: '' },
+      '', new Date('2026-11-03T00:00:00.000Z'))
+    expect(h.engine.receive(origin)).toBe('stored')
+    h.engine.evaluateDue()
+    const decision = h.engine.decide(origin.id, { kind: 'accept', title: 'Answer a question', scope: 'small', reason: 'requested',
+      evalId: h.engine.candidate(origin.id)!.evalId })
+    const ticketId = decision.ticketId!
+    // The notification is posted as a new Feishu message; its thread key is the chat and that message.
+    vi.spyOn(h.commands, 'lark').mockResolvedValue({ message_id: 'om_question', chat_id: 'oc_team' } as never)
+    const kind = spoolKindWith((ticket, thread) => h.engine.followForContext(ticket, thread))
+    const notification: OutboundMessage = { id: 'attention-r1', kind: 'reply', text: '选 A 还是 B？', ticketId,
+      channel: { source: 'spool', thread: 'spool:chief/m1', address: { conversation: 'chief', root: 'm1', message: 'm1', sender: 'relay',
+        reply: 'feishu', notifyChat: 'oc_team' } } }
+    expect(await kind.channel!.send({ commands: h.commands }, notification)).toBe('sent')
+    expect(h.store.threads.get('feishu:oc_team:om_question')?.subscriptions).toContain(ticketId)
+    // An answer in that thread reaches the Ticket, marked as context because the Ticket did not start on the thread.
+    const answer: Trigger = { id: 'answer-1', source: 'spool', threads: [{ source: 'feishu', id: 'oc_team:om_question' }],
+      actor: { source: 'spool', id: 'relay' }, human: true, addressed: 'direct', at: '2026-11-03T01:00:00.000Z', text: 'A',
+      channel: { source: 'spool', thread: 'feishu:oc_team:om_question', address: {} }, meta: { sender: 'relay' } }
+    expect(h.engine.receive(answer)).toBe('stored')
+    const ticket = h.store.tickets.get(ticketId)!
+    expect(ticket.inputs.some(input => input.kind === 'trigger' && input.triggerId === 'answer-1' && input.context)).toBe(true)
+    expect(h.store.triggers.disposition('answer-1')?.context).toContain(ticketId)
     h.store.close()
   })
   it('explains filtering, policy rows and the variables a Ticket receives', () => {
@@ -219,7 +268,7 @@ describe('the spool Source', () => {
     const disposers: (() => unknown)[] = []
     applySpool({ orchestrator: h, effect: (effect: () => () => unknown) => { disposers.push(effect()) } } as never)
     await vi.waitFor(() => expect(h.health.spool).toMatchObject({ state: 'paused', code: 'setupPending' }))
-    expect(sources.kind('spool')).toBe(spoolKind)
+    expect(sources.kind('spool')?.kind).toBe('spool')
     for (const dispose of disposers) await dispose()
     expect(sources.kind('spool')).toBeUndefined()
 
