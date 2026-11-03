@@ -8,6 +8,7 @@ import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { pathToFileURL } from 'node:url'
 import { z } from 'zod'
 import { isoTime, key, threadKey, type OutboundMessage, type Trigger } from '../core/index.ts'
+import { feishuChatLink } from './feishu-channel.ts'
 import { health, sourceContext, type SourceContext } from './host.ts'
 import type { SourceKind } from './kind.ts'
 import { pause } from './poll.ts'
@@ -24,13 +25,20 @@ const Id = z.string().regex(/^[A-Za-z0-9_.:-]{1,80}$/)
 const ConversationId = z.string().regex(/^(?!\.{1,2}$)[A-Za-z0-9_.-]{1,80}$/)
 /** A page people open from the panel; only web links, not a `javascript:` or `file:` scheme. */
 const WebUrl = z.url().refine(value => /^https?:$/.test(new URL(value).protocol), 'An http(s) URL')
+/** Where a sender's replies go: the reply folder, a Feishu chat, or both. */
+const ReplyTarget = z.enum(['json', 'feishu', 'both'])
 const SenderSchema = z.object({
   id: Slug,
   /** `person` for a program that relays what a person asked, whose messages may be explicit requests; `bot` for one acting on its own. */
   kind: z.enum(['person', 'bot']).default('bot'),
   /** The business a request belongs to when the request does not name one. */
   business: z.string().trim().regex(/^([a-z0-9][a-z0-9-]*)?$/).default(''),
+  /** Where replies go for this sender; `json` is the reply folder alone. */
+  reply: ReplyTarget.default('json'),
+  /** The Feishu chat that receives replies when `reply` is `feishu` or `both`; empty when replies stay in the folder. */
+  notifyChat: z.string().trim().regex(/^(oc_[a-zA-Z0-9]+)?$/, 'A Feishu chat id').default(''),
 }).strict()
+  .refine(sender => sender.reply === 'json' || !!sender.notifyChat, 'A Feishu chat id is required when replies go to Feishu')
 const SpoolConfigSchema = z.object({
   inDir: AbsolutePath.default(''),
   outDir: AbsolutePath.default(''),
@@ -64,7 +72,7 @@ export type SpoolMessage = z.infer<typeof SpoolMessageSchema>
  * One request file as a Trigger. Its Thread is the conversation and the message that began the exchange, so later messages
  * naming it follow up. A person's program makes explicit requests; a program acting for itself is at most an inferred candidate.
  */
-export function spoolTrigger(message: SpoolMessage, sender: Pick<SpoolSender, 'kind' | 'business'>, outDir: string, now: Date): Trigger {
+export function spoolTrigger(message: SpoolMessage, sender: Pick<SpoolSender, 'kind' | 'business' | 'reply' | 'notifyChat'>, outDir: string, now: Date): Trigger {
   const root = message.thread ?? message.id
   const thread = { source: SPOOL, id: `${message.conversation}/${root}` }
   const person = sender.kind === 'person'
@@ -74,8 +82,10 @@ export function spoolTrigger(message: SpoolMessage, sender: Pick<SpoolSender, 'k
     actor: { source: SPOOL, id: message.sender }, human: person,
     ...message.addressed ? { addressed: 'direct' as const } : {},
     at: message.at ? isoTime(message.at) : now.toISOString(), text: message.text,
+    // The address records where this request's replies go while it is open: the folder and/or the Feishu chat.
     channel: { source: SPOOL, thread: threadKey(thread), address: { conversation: message.conversation, root, message: message.id,
-      sender: message.sender, ...outDir ? { dir: join(outDir, message.conversation) } : {} } },
+      sender: message.sender, ...outDir ? { dir: join(outDir, message.conversation) } : {},
+      ...sender.reply !== 'json' ? { reply: sender.reply, notifyChat: sender.notifyChat } : {} } },
     ...message.url ? { url: message.url } : {},
     meta: { conversation: message.conversation, sender: message.sender, root, messageId: message.id, ...business ? { business } : {},
       ...message.type ? { type: message.type } : {}, ...message.repo ? { repo: message.repo } : {} },
@@ -83,12 +93,24 @@ export function spoolTrigger(message: SpoolMessage, sender: Pick<SpoolSender, 'k
 }
 /**
  * Writes a reply as `<outDir>/<conversation>/<message id>.json`, once; the program on the other side reads and removes it.
- * A request received while no reply folder was set has nowhere to be answered, so its replies are dropped as `gone`.
+ * A sender may instead send its replies to a Feishu chat, or to both places: a Feishu reply is a new bot message, because a
+ * request has no Feishu message to answer in a thread. The message id keys both deliveries, so a retry writes and posts once.
+ * An acknowledgement is the program's bookkeeping, so it stays in the reply folder.
  */
-export async function sendSpool(_host: unknown, message: OutboundMessage, now = new Date()): Promise<'sent' | 'gone'> {
-  const { conversation, root, message: replyTo, dir } = message.channel.address
-  if (!dir) return 'gone'
+export async function sendSpool(host: Pick<SourceContext, 'commands'> | undefined, message: OutboundMessage,
+  now = new Date()): Promise<'sent' | 'gone'> {
+  const { conversation, root, message: replyTo, dir, notifyChat, reply } = message.channel.address
   if (!Id.safeParse(message.id).success) throw new Error(`The spool reply id ${message.id} is not a file name`)
+  const route = reply === 'feishu' || reply === 'both' ? reply : 'json'
+  const toPerson = message.kind === 'reply' && route !== 'json' && !!notifyChat
+  // A reply goes to the folder unless the sender chose the chat alone; other messages are always the program's.
+  const toFolder = !!dir && (message.kind !== 'reply' || route !== 'feishu')
+  // The person is told before the file is written: a broken reply folder does not hold back a reply written for that person.
+  if (toPerson) {
+    if (!host) throw new Error('A spool reply to a Feishu chat needs the deployment commands')
+    await host.commands.lark(['im', '+messages-send', '--chat-id', notifyChat, '--markdown', message.text, '--idempotency-key', message.id])
+  }
+  if (!toFolder) return toPerson ? 'sent' : 'gone'
   await mkdir(dir, { recursive: true })
   const body = JSON.stringify({ id: message.id, kind: message.kind, conversation: conversation ?? '', thread: root ?? '', replyTo: replyTo ?? '',
     ticket: message.ticketId ?? null, text: message.text, at: now.toISOString() }, null, 2)
@@ -118,12 +140,16 @@ export const spoolKind: SourceKind<SpoolConfig> = {
       hint: { zh: '绝对路径。回复写成 <对话>/<消息 id>.json，程序读取后自行删除。',
         en: 'An absolute path. Replies are written as <conversation>/<message id>.json; the program reads and removes them.' } },
     { key: 'senders', type: 'rows', label: { zh: '发送者', en: 'Senders' },
-      hint: { zh: '“转达人的请求”的发送者可以发起明确请求；“程序自己”的发送者只能成为推断的候选。身份在这里固定，程序改不了。',
-        en: 'A sender that "Relays a person" may originate explicit requests; one acting for "Itself" can only become an inferred candidate. The identity is fixed here, not by the program.' },
+      hint: { zh: '“转达人的请求”的发送者可以发起明确请求；“程序自己”的发送者只能成为推断的候选。身份在这里固定，程序改不了。回复到可选回复目录、飞书会话或两者；选飞书时填 chat_id，消息以机器人新消息发出，确认（ack）仍只写目录。',
+        en: 'A sender that "Relays a person" may originate explicit requests; one acting for "Itself" can only become an inferred candidate. The identity is fixed here, not by the program. Replies may go to the reply folder, a Feishu chat, or both; a Feishu chat is a chat id, replies are new bot messages, and acknowledgements stay in the folder.' },
       columns: [
         { key: 'id', type: 'text', label: { zh: '发送者 id', en: 'Sender id' }, pattern: '[a-z0-9][a-z0-9\\-]*' },
         { key: 'kind', type: 'select', label: { zh: '代表', en: 'Acts for' }, options: [
           { value: 'person', label: { zh: '转达人的请求', en: 'Relays a person' } }, { value: 'bot', label: { zh: '程序自己', en: 'Itself' } }] },
+        { key: 'reply', type: 'select', label: { zh: '回复到', en: 'Reply to' }, options: [
+          { value: 'json', label: { zh: '回复目录', en: 'JSON folder' } }, { value: 'feishu', label: { zh: '飞书会话', en: 'Feishu chat' } },
+          { value: 'both', label: { zh: '两者', en: 'Both' } }] },
+        { key: 'notifyChat', type: 'text', label: { zh: '飞书 chat_id', en: 'Feishu chat id' }, pattern: 'oc_[a-zA-Z0-9]+', optional: true },
         { key: 'business', type: 'text', label: { zh: '默认业务', en: 'Default business' }, optional: true }] },
     { key: 'pollSeconds', type: 'number', advanced: true, min: 2, max: 600, label: { zh: '轮询间隔 / 秒', en: 'Polling interval / seconds' } }],
   health: [SPOOL],
@@ -134,9 +160,12 @@ export const spoolKind: SourceKind<SpoolConfig> = {
   channel: {
     // A reply goes only to a listed sender's conversation, inside the reply folder the Source is configured with.
     allowed: (address, config) => config.senders.some(item => item.id === address.sender) && (!address.dir || inside(config.outDir, address.dir)),
-    send: (host, message) => sendSpool(host, message),
-    link: address => ({ url: fileUrl(address.dir ?? ''),
-      label: { zh: `投递目录对话 ${address.conversation ?? ''}`.trim(), en: `Spool conversation ${address.conversation ?? ''}`.trim() } }),
+    send: sendSpool,
+    // A reply whose sender chose Feishu alone has no file to open; its link opens the chat instead.
+    link: (address, links) => address.reply === 'feishu' && address.notifyChat
+      ? { url: feishuChatLink(links.feishu?.brand ?? 'feishu', address.notifyChat), label: { zh: '飞书会话', en: 'Feishu chat' } }
+      : { url: fileUrl(address.dir ?? ''),
+        label: { zh: `投递目录对话 ${address.conversation ?? ''}`.trim(), en: `Spool conversation ${address.conversation ?? ''}`.trim() } },
   },
   find: query => ({ threads: /^spool:\S+$/.test(query.trim()) ? [query.trim()] : [], terms: [] }),
   policy: {
@@ -253,7 +282,7 @@ export async function readSpool(ctx: SourceContext, config: SpoolConfig, now: Da
     }
     const parsed = SpoolMessageSchema.safeParse(value)
     if (!parsed.success) { round.unreadable += 1; await moveInto(file, join(config.inDir, '.bad')); continue }
-    const sender = config.senders.find(item => item.id === parsed.data.sender) ?? { kind: 'bot' as const, business: '' }
+    const sender = config.senders.find(item => item.id === parsed.data.sender) ?? { kind: 'bot' as const, business: '', reply: 'json' as const, notifyChat: '' }
     const trigger = spoolTrigger(parsed.data, sender, config.outDir, now)
     // An unlisted sender's request is still received, so the panel shows it as filtered with the reason.
     const result = await ctx.receive(trigger)

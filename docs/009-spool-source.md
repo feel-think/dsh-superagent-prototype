@@ -12,7 +12,7 @@ The kind is `spool`. It ships as the `dsh-superagent/spool-watch` plugin, insert
 | --- | --- |
 | Incoming folder | An absolute path. The Source polls `*.json` files here. Read files move into `.done`; files that are not a valid request move into `.bad`; unreadable files stay and count as failing. |
 | Reply folder | An absolute path. A reply is written as `<reply folder>/<conversation>/<message id>.json`. Leave it empty while requests need no answers. |
-| Senders | The identities a program may use. Each has an `id`, an **Acts for** value (`Relays a person` or `Itself`) and an optional default business. The identity is fixed here: a program cannot choose to be a person by writing a field. |
+| Senders | The identities a program may use. Each has an `id`, an **Acts for** value (`Relays a person` or `Itself`), an optional default business, and a **Reply to** choice (`JSON folder`, `Feishu chat` or `Both`) with the Feishu chat that receives replies; see [Where replies go](#where-replies-go). The identity is fixed here: a program cannot choose to be a person by writing a field. |
 | Polling interval | Seconds between reads; 2–600, default 5. |
 
 A program writes a complete file and renames it into the incoming folder, so the Source never reads half-written JSON. Both folders must be writable by the user dsh-superagent runs as.
@@ -74,19 +74,29 @@ The agent answers where the Trigger's Channel points: a file named after the out
 }
 ```
 
-`kind` is `acknowledgement`, `reply` or `notice`. The file is written once and never replaced, so a retried send stays idempotent; the program reads the file and removes it. A request received while the reply folder was empty has no destination, so its messages are dropped as `gone` and the Source shows them in the panel.
+`kind` is `acknowledgement`, `reply` or `notice`. The file is written once and never replaced, so a retried send stays idempotent; the program reads the file and removes it. A request received while its destination was empty (no reply folder, or no Feishu chat for a Feishu reply) has nowhere to go, so its messages are dropped as `gone` and the Source shows them in the panel.
 
 Changing the reply folder after a request has been received drops that Ticket's later replies: the saved Channel address is checked against the current folder. Finish open Tickets first, or keep the old folder configured.
 
-## Notifying a person in Feishu
+## Where replies go
 
-A Spool-triggered Ticket has no Feishu Channel: its replies go to the reply folder. To notify a person in Feishu, put the destination chat in the request — for example a line `notify: feishu chat oc_…` — and have the worker send it with the bot's CLI after the work:
+A Spool Channel reaches a program, not the person behind it. A sender chooses where its replies go:
+
+- **JSON folder** (the default): replies are written to the reply folder, as above.
+- **Feishu chat**: replies are posted to a chat by the deployment's Feishu bot. A request has no Feishu message to answer in a thread, so each reply is a new message in the chat; the message id is its idempotency key, so a retried delivery posts once.
+- **Both**: the reply file and the Feishu message.
+
+An acknowledgement is the program's bookkeeping, so it always goes to the reply folder, even for a Feishu sender. The choice is recorded on the request when it arrives; changing a sender's setting affects later requests, so finish open Tickets first or keep the old setting.
+
+A Feishu reply needs the deployment's Feishu bot and the bot must be in the chat; a failed send is retried and shows under the **Messages to Channels** health. A person's answer in Feishu arrives as a new Feishu message, not on the Spool Thread: the main Session decides whether to route it to the Ticket.
+
+A worker that needs to send an extra message can still use the bot-only `lark-cli` it receives:
 
 ```sh
-lark-cli im +messages-send --chat-id oc_… --text "…"
+lark-cli im +messages-send --chat-id oc_… --markdown "…"
 ```
 
-This works without a code change when the deployment has a Feishu bot, because workers get a bot-only `lark-cli`. It is not the Outbox: the send has no idempotency key, retry or audit, so keep the message short and repeatable. For a built-in path, the Source would need a notification target of its own.
+That path has no idempotency key, retry or audit; prefer a sender's **Reply to** setting for the Ticket's own replies.
 
 ## Who may originate work
 
