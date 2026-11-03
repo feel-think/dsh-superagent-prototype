@@ -22,6 +22,8 @@ export function health(state: Health['state'], code: HealthCode, values: Record<
   return { state, detail: fill(HEALTH_TEXT[code], values), code, ...Object.keys(values).length ? { values } : {} }
 }
 export interface SourceHost {
+  /** The instance state directory, for plugins that keep per-instance files without duplicating machine configuration. */
+  readonly stateDir: string
   readonly sources: SourceRegistry
   /** Returns the context for one Source kind; its `report` writes only the health entries declared by the kind. */
   context(kind: { kind: string; health: readonly string[] }): SourceContext

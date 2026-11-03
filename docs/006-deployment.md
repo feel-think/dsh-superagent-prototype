@@ -94,8 +94,9 @@ Copy [examples/profile.cordis.patch.yml](../examples/profile.cordis.patch.yml) t
 | --- | --- | --- |
 | `stateDir` | yes | Absolute path: the database, the lock, the command shims in `worker-bin`, the agent's git configuration and, by default, the Ticket directories in `work`. Back it up before upgrades |
 | `promptMaxChars`, `admissionContextMaxPages`, `admissionContextTimeoutMs` | no | The largest saved prompt configuration, and how many Thread pages one assessment reads within what time |
+| `mcpToolAllowlist` | no | MCP tool names, or prefixes ending in `__`, that main and Worker Sessions may call in addition to their built-in tools. Set `mcp__openviking__` to allow OpenViking's full MCP surface |
 
-After the first start, edit machine limits in **Settings → Deployment** or the DeepSeek Harness Plugin Manager. Changes apply without restart. `stateDir` cannot be changed there. Invalid values or unknown configuration keys prevent startup; the log identifies the key.
+After the first start, edit machine limits in **Settings → Deployment** or the DeepSeek Harness Plugin Manager. Changes apply without restart. `stateDir` cannot be changed there. `mcpToolAllowlist` is read when a Session is decorated, so restart after changing it. Invalid values or unknown configuration keys prevent startup; the log identifies the key.
 
 ## Start and stop
 
