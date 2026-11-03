@@ -7,9 +7,10 @@ import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/p
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { z } from 'zod'
-import { isoTime, key, threadKey, type OutboundMessage, type Trigger } from '../core/index.ts'
+import { isoTime, key, threadKey, type OutboundMessage, type ThreadRef, type Trigger } from '../core/index.ts'
+import { checkedImText } from '../infra/text.ts'
 import { feishuChatLink } from './feishu-channel.ts'
-import { health, sourceContext, type SourceContext } from './host.ts'
+import { health, sourceContext, type SourceContext, type SourceHost } from './host.ts'
 import type { SourceKind } from './kind.ts'
 import { pause } from './poll.ts'
 
@@ -91,14 +92,17 @@ export function spoolTrigger(message: SpoolMessage, sender: Pick<SpoolSender, 'k
       ...message.type ? { type: message.type } : {}, ...message.repo ? { repo: message.repo } : {} },
   }
 }
+/** Makes a live Ticket follow a Thread for context; the runtime supplies it so a Source can bind a thread it created. */
+export type FollowThread = (ticketId: string, thread: ThreadRef) => boolean
 /**
  * Writes a reply as `<outDir>/<conversation>/<message id>.json`, once; the program on the other side reads and removes it.
  * A sender may instead send its replies to a Feishu chat, or to both places: a Feishu reply is a new bot message, because a
  * request has no Feishu message to answer in a thread. The message id keys both deliveries, so a retry writes and posts once.
- * An acknowledgement is the program's bookkeeping, so it stays in the reply folder.
+ * After posting, the Ticket follows the thread that message started, so a person's answer there reaches the Executor without
+ * anyone forwarding it. An acknowledgement is the program's bookkeeping, so it stays in the reply folder.
  */
 export async function sendSpool(host: Pick<SourceContext, 'commands'> | undefined, message: OutboundMessage,
-  now = new Date()): Promise<'sent' | 'gone'> {
+  follow?: FollowThread, now = new Date()): Promise<'sent' | 'gone'> {
   const { conversation, root, message: replyTo, dir, notifyChat, reply } = message.channel.address
   if (!Id.safeParse(message.id).success) throw new Error(`The spool reply id ${message.id} is not a file name`)
   const route = reply === 'feishu' || reply === 'both' ? reply : 'json'
@@ -108,7 +112,20 @@ export async function sendSpool(host: Pick<SourceContext, 'commands'> | undefine
   // The person is told before the file is written: a broken reply folder does not hold back a reply written for that person.
   if (toPerson) {
     if (!host) throw new Error('A spool reply to a Feishu chat needs the deployment commands')
-    await host.commands.lark(['im', '+messages-send', '--chat-id', notifyChat, '--markdown', message.text, '--idempotency-key', message.id])
+    // The spool channel is not the Feishu one, so the Outbox's own IM limit check does not see this message.
+    const text = checkedImText(message.text)
+    const sent = await host.commands.lark<{ message_id?: string; chat_id?: string }>(
+      ['im', '+messages-send', '--chat-id', notifyChat, '--markdown', text, '--idempotency-key', message.id])
+    // The message is its thread's root; a Feishu Thread key is `<chat>:<root message>`. Results often go out after the
+    // Ticket ended, when there is nothing left to follow; any other failure keeps the receipt pending so the send retries.
+    if (follow && message.ticketId && sent?.message_id) {
+      const chat = sent.chat_id || notifyChat
+      try { follow(message.ticketId, { source: 'feishu', id: `${chat}:${sent.message_id}` }) }
+      catch (error) {
+        const code = (error as { code?: unknown }).code
+        if (code !== 'ticketEnded' && code !== 'unknownTicket') throw error
+      }
+    }
   }
   if (!toFolder) return toPerson ? 'sent' : 'gone'
   await mkdir(dir, { recursive: true })
@@ -220,12 +237,25 @@ export const spoolKind: SourceKind<SpoolConfig> = {
     },
   },
 }
+/** The Source kind, with the runtime's context-follow operation used by the Feishu reply path (absent in a bare host). */
+export function spoolKindWith(follow?: FollowThread): SourceKind<SpoolConfig> {
+  return { ...spoolKind, channel: { ...spoolKind.channel!, send: (host, message) => sendSpool(host, message, follow) } }
+}
+/**
+ * The running app declares `engine` publicly but `SourceHost` does not, and a Source context has no follow operation, so
+ * the plugin reads that one operation defensively: without it, replies still go out, just without the automatic answer loop.
+ */
+type FollowHost = SourceHost & { engine?: { followForContext?: (ticketId: string, thread: ThreadRef) => boolean } }
 export const name = 'dsh-superagent-spool'
 export const inject = ['orchestrator']
 export function apply(ctx: Context): void {
-  ctx.effect(() => ctx.orchestrator.sources.register(spoolKind), 'spool: source kind')
+  const host = ctx.orchestrator as FollowHost
+  const follow: FollowThread | undefined = typeof host.engine?.followForContext === 'function'
+    ? (ticketId, thread) => host.engine!.followForContext!(ticketId, thread) : undefined
+  const kind = spoolKindWith(follow)
+  ctx.effect(() => ctx.orchestrator.sources.register(kind), 'spool: source kind')
   ctx.effect(() => {
-    const source = sourceContext(ctx.orchestrator, spoolKind)
+    const source = sourceContext(ctx.orchestrator, kind)
     const controller = new AbortController()
     // Unhandled rejections terminate the DSH process, so a failure escaping the polling loop is reported as Source health instead.
     const running = watch(source, controller.signal)
