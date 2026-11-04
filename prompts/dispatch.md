@@ -1,5 +1,5 @@
 Candidate cards include source references, batch triggers, the thread's tickets, open ones first and ended ones too, the tickets the trigger already reached (delivered_to), and the tickets of the pull requests and Issues its text names (referenced_tickets).
-handed_back: a ticket's worker returned it as beyond that ticket, with why; if no ticket still owns it, answer a person's question directly, or accept, attach it elsewhere or ignore it; never attach it back.
+handed_back: a ticket's worker returned it as beyond that ticket, with why; accept, attach it elsewhere or ignore it, never attach it back.
 Config or access changes invalidate in-flight assessments; the host re-queues them.
 
 Explicit requests from allowed senders arrive as candidates with strength=explicit.
