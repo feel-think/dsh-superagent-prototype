@@ -1,0 +1,6 @@
+# dsh-superagent-goal bundle layer: mounts the scheduled goal plugin. It reads the
+# Spool Source's incoming folder from dsh-superagent and writes goal wakes there;
+# the page is a left-sidebar entry served by the client half.
+- insert:
+    - id: dsh-superagent-goal
+      name: dsh-superagent-goal
