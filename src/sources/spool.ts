@@ -8,7 +8,6 @@ import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { pathToFileURL } from 'node:url'
 import { z } from 'zod'
 import { isoTime, key, threadKey, type OutboundMessage, type ThreadRef, type Trigger } from '../core/index.ts'
-import { checkedImText } from '../infra/text.ts'
 import { feishuChatLink } from './feishu-channel.ts'
 import { health, sourceContext, type SourceContext, type SourceHost } from './host.ts'
 import type { SourceKind } from './kind.ts'
@@ -112,8 +111,8 @@ export async function sendSpool(host: Pick<SourceContext, 'commands'> | undefine
   // The person is told before the file is written: a broken reply folder does not hold back a reply written for that person.
   if (toPerson) {
     if (!host) throw new Error('A spool reply to a Feishu chat needs the deployment commands')
-    // The spool channel is not the Feishu one, so the Outbox's own IM limit check does not see this message.
-    const text = checkedImText(message.text)
+    // The spool channel sends the reply as written: its operator removed the IM word limit for this path.
+    const text = message.text
     const sent = await host.commands.lark<{ message_id?: string; chat_id?: string }>(
       ['im', '+messages-send', '--chat-id', notifyChat, '--markdown', text, '--idempotency-key', message.id])
     // The message is its thread's root; a Feishu Thread key is `<chat>:<root message>`. Results often go out after the

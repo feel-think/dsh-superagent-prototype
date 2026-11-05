@@ -206,12 +206,12 @@ describe('the spool Source', () => {
     const failing = spoolKindWith(() => { throw new Error('database unavailable') })
     await expect(failing.channel!.send({ commands: h.commands }, message('reply', 'r8', { reply: 'feishu', notifyChat: 'oc_team' })))
       .rejects.toThrow('database unavailable')
-    // The spool channel is not the Feishu one, so the Outbox limit check does not apply; sendSpool enforces it.
+    // The operator removed the IM word limit, so a long reply is sent as it is.
     lark.mockClear()
     const long = message('reply', 'r9', { reply: 'feishu', notifyChat: 'oc_team' })
     long.text = 'word '.repeat(101)
-    await expect(kind.channel!.send({ commands: h.commands }, long)).rejects.toThrow('maximum is 100')
-    expect(lark).not.toHaveBeenCalled()
+    expect(await kind.channel!.send({ commands: h.commands }, long)).toBe('sent')
+    expect(lark).toHaveBeenCalledOnce()
     // The route defaults to the folder, and Feishu replies need a chat id.
     expect(spoolKind.schema.parse({ senders: [{ id: 'relay' }] }))
       .toMatchObject({ senders: [{ id: 'relay', reply: 'json', notifyChat: '' }] })
